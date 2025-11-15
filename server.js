@@ -79,7 +79,14 @@ const ALLOWED_ORIGINS_INPUT = (process.env.ALLOWED_ORIGINS || process.env.ALLOWE
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
-const DEV_ORIGINS = ['http://localhost:5173','http://127.0.0.1:5173','http://localhost:3000','http://127.0.0.1:3000']
+const DEV_ORIGINS = [
+  'http://localhost:5173','http://127.0.0.1:5173',
+  'http://localhost:5174','http://127.0.0.1:5174',
+  'http://localhost:5175','http://127.0.0.1:5175',
+  'http://localhost:5176','http://127.0.0.1:5176',
+  'http://localhost:5177','http://127.0.0.1:5177',
+  'http://localhost:3000','http://127.0.0.1:3000'
+]
 const STATIC_ALLOWED_ORIGINS = Array.from(new Set([...expandOrigins(ALLOWED_ORIGINS_INPUT), ...DEV_ORIGINS]))
 const ALLOWED_ORIGIN_REGEX = process.env.ALLOWED_ORIGIN_REGEX ? new RegExp(process.env.ALLOWED_ORIGIN_REGEX) : null
 const FRONTEND_URL = process.env.FRONTEND_URL || STATIC_ALLOWED_ORIGINS[0] || 'https://soilcalcify.com'
@@ -1468,10 +1475,12 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
 
     // Deactivate any existing profile images for this user
     try {
-      await pool.execute(
+      console.log(`Deactivating existing images for user ${req.auth.userId} and type ${image_type}`)
+      const [deactivateResult] = await pool.execute(
         `UPDATE \`${DB_NAME}\`.user_images SET is_active = 0 WHERE user_id = ? AND image_type = ?`,
         [req.auth.userId, image_type]
       )
+      console.log(`Deactivated ${deactivateResult.affectedRows} existing images`)
     } catch (err) {
       console.error('Failed to deactivate existing images:', err)
       // Continue with upload even if deactivation fails
@@ -1480,11 +1489,13 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
     // Insert new image
     let result
     try {
+      console.log(`Inserting new image for user ${req.auth.userId}, type: ${image_type}, mime: ${mime_type}, size: ${fileSize}`)
       const [insertResult] = await pool.execute(
         `INSERT INTO \`${DB_NAME}\`.user_images (user_id, image_data, mime_type, image_type, file_size, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [req.auth.userId, image_data, mime_type, image_type, fileSize, width || null, height || null]
       )
       result = insertResult
+      console.log(`Image inserted successfully with ID: ${result.insertId}`)
     } catch (err) {
       console.error('Failed to insert image into database:', err)
       return res.status(500).json({ error: 'Failed to save image to database' })
@@ -1596,6 +1607,7 @@ app.get('/api/me/image/:id', async (req, res) => {
 // Get user's active profile image
 app.get('/api/me/image', requireAuth, async (req, res) => {
   try {
+    console.log(`Fetching active profile image for user: ${req.auth.userId}`)
     const [rows] = await pool.execute(
       `SELECT id, image_data, mime_type, created_at FROM \`${DB_NAME}\`.user_images 
        WHERE user_id = ? AND image_type = 'profile' AND is_active = 1 
@@ -1604,11 +1616,13 @@ app.get('/api/me/image', requireAuth, async (req, res) => {
       [req.auth.userId]
     )
 
+    console.log(`Found ${rows.length} active profile images for user ${req.auth.userId}`)
     if (!rows || rows.length === 0) {
       return res.status(404).json({ error: 'No profile image found' })
     }
 
     const image = rows[0]
+    console.log(`Returning image ID: ${image.id}, mime_type: ${image.mime_type}`)
     // Return full URL for the image
     const baseUrl = `${req.protocol}://${req.get('host')}`
     return res.json({
