@@ -111,7 +111,7 @@ app.options('*', cors({
   methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'X-CSRF-Token'],
 }))
-app.use(express.json({ limit: '1mb' }))
+
 app.use(cookieParser())
 // Serve uploaded files (read-only)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
@@ -1372,28 +1372,34 @@ app.post('/api/me/avatar', requireAuth, upload.single('file'), async (req, res) 
 // Store user image as base64
 app.post('/api/me/image', requireAuth, async (req, res) => {
   try {
+    console.log('Received image upload request from user:', req.auth.userId)
     const { image_data, mime_type, image_type = 'profile', width, height } = req.body || {}
     
     // Input validation
     if (!image_data || !mime_type) {
+      console.log('Missing image_data or mime_type')
       return res.status(400).json({ error: 'Image data and MIME type are required' })
     }
     
     if (typeof image_data !== 'string' || image_data.length === 0) {
+      console.log('Invalid image_data type or empty')
       return res.status(400).json({ error: 'Image data must be a non-empty string' })
     }
     
     if (typeof mime_type !== 'string' || mime_type.length === 0) {
+      console.log('Invalid mime_type type or empty')
       return res.status(400).json({ error: 'MIME type must be a non-empty string' })
     }
     
     // Validate image_type if provided
     if (image_type && typeof image_type !== 'string') {
+      console.log('Invalid image_type type')
       return res.status(400).json({ error: 'Image type must be a string' })
     }
     
     // Validate dimensions if provided
     if (width !== undefined && (typeof width !== 'number' || width < 0)) {
+      console.log('Invalid width:', width)
       return res.status(400).json({ error: 'Width must be a positive number' })
     }
     if (height !== undefined && (typeof height !== 'number' || height < 0)) {
@@ -1403,24 +1409,28 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
     // Validate MIME type
     const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
     if (!allowedTypes.includes(mime_type)) {
+      console.log('Invalid mime_type:', mime_type)
       return res.status(400).json({ error: 'Invalid image type. Allowed: JPG, PNG, WebP' })
     }
 
     // Validate base64 data (basic check)
     if (!/^data:image\/[a-zA-Z+]+;base64,/.test(image_data)) {
+      console.log('Invalid base64 format')
       return res.status(400).json({ error: 'Invalid image data format. Must start with data:image/...;base64,' })
     }
 
     // Calculate file size (approximate)
     const base64Data = image_data.split(',')[1]
     if (!base64Data || base64Data.length === 0) {
+      console.log('Empty base64 content')
       return res.status(400).json({ error: 'Invalid base64 data' })
     }
     const fileSize = Math.ceil(base64Data.length * 0.75)
 
     // Check file size (5MB limit)
     if (fileSize > 5 * 1024 * 1024) {
-      return res.status(400).json({ error: 'Image size must be less than 5MB' })
+      console.log('File too large:', fileSize, 'bytes')
+      return res.status(400).json({ error: `Image size must be less than 5MB. Current size: ${(fileSize / 1024 / 1024).toFixed(2)}MB` })
     }
 
     // Deactivate any existing profile images for this user
@@ -1462,6 +1472,7 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
     // Clear cache
     clearUserCache(req.auth.userId)
 
+    console.log('Image saved successfully, returning URL:', imageUrl)
     return res.json({ 
       id: result.insertId, 
       url: imageUrl,
@@ -1477,6 +1488,8 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
 app.get('/api/me/image/:id', requireAuth, async (req, res) => {
   try {
     const imageId = Number(req.params.id)
+    console.log(`Serving image ID: ${imageId} for user: ${req.auth.userId}`)
+    
     if (!imageId) return res.status(400).json({ error: 'Invalid image ID' })
 
     const [rows] = await pool.execute(
@@ -1484,11 +1497,14 @@ app.get('/api/me/image/:id', requireAuth, async (req, res) => {
       [imageId, req.auth.userId]
     )
 
+    console.log(`Image query result:`, rows)
+    
     if (!rows || rows.length === 0) {
       return res.status(404).json({ error: 'Image not found' })
     }
 
     const image = rows[0]
+    console.log(`Found image with mime_type: ${image.mime_type}`)
     
     // Set appropriate headers and send image data
     res.setHeader('Content-Type', image.mime_type)
@@ -1498,6 +1514,7 @@ app.get('/api/me/image/:id', requireAuth, async (req, res) => {
     const base64Data = image.image_data.split(',')[1]
     const imageBuffer = Buffer.from(base64Data, 'base64')
     
+    console.log(`Sending image buffer of size: ${imageBuffer.length} bytes`)
     return res.send(imageBuffer)
   } catch (err) {
     console.error('GET /api/me/image/:id error:', err)
@@ -1521,9 +1538,11 @@ app.get('/api/me/image', requireAuth, async (req, res) => {
     }
 
     const image = rows[0]
+    // Return full URL for the image
+    const baseUrl = `${req.protocol}://${req.get('host')}`
     return res.json({
       id: image.id,
-      url: `/api/me/image/${image.id}`,
+      url: `${baseUrl}/api/me/image/${image.id}`,
       mime_type: image.mime_type,
       created_at: image.created_at
     })
