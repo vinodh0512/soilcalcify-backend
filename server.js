@@ -470,6 +470,16 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
   }
 })
 
+// Logout endpoint (stateless JWT): instruct client to clear tokens
+app.post('/api/logout', (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store')
+    return res.status(200).json({ message: 'Logged out' })
+  } catch {
+    return res.status(200).json({ message: 'Logged out' })
+  }
+})
+
 // Admin login (username/password) using env-configured credentials.
 // Configure ADMIN_USERNAME and ADMIN_PASSWORD_HASH in backend/.env
 app.post('/api/admin/login', loginRateLimiter, async (req, res) => {
