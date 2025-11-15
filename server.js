@@ -985,16 +985,58 @@ async function ensureSchema() {
 // Simple cache for /api/me to reduce DB hits
 const meCache = new Map() // userId -> { data, expires }
 
+// Cache management functions
+function clearUserCache(userId) {
+  try {
+    if (userId && typeof userId === 'number' && userId > 0) {
+      meCache.delete(userId)
+    }
+  } catch (err) {
+    console.error('Failed to clear user cache:', err)
+  }
+}
+
+function clearAllCache() {
+  try {
+    meCache.clear()
+  } catch (err) {
+    console.error('Failed to clear all cache:', err)
+  }
+}
+
 async function getUserById(userId) {
-  const cache = meCache.get(userId)
-  if (cache && cache.expires > Date.now()) return cache.data
-  const [rows] = await pool.execute(
-    'SELECT id, name, email, first_name, last_name, phone, company, title, bio, location, website_url, twitter_url, linkedin_url, github_url, avatar_url, updated_at FROM users WHERE id = ? LIMIT 1',
-    [userId]
-  )
-  const data = rows && rows[0] ? rows[0] : null
-  meCache.set(userId, { data, expires: Date.now() + 60 * 1000 }) // cache 60s
-  return data
+  try {
+    // Validate userId
+    if (!userId || typeof userId !== 'number' || userId <= 0) {
+      console.error('Invalid userId provided to getUserById:', userId)
+      return null
+    }
+    
+    const cache = meCache.get(userId)
+    if (cache && cache.expires > Date.now()) {
+      return cache.data
+    }
+    
+    const [rows] = await pool.execute(
+      'SELECT id, name, email, first_name, last_name, phone, company, title, bio, location, website_url, twitter_url, linkedin_url, github_url, avatar_url, updated_at FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    )
+    
+    const data = rows && rows[0] ? rows[0] : null
+    
+    // Only cache if we have valid data
+    if (data) {
+      meCache.set(userId, { data, expires: Date.now() + 60 * 1000 }) // cache 60s
+    } else {
+      // Cache null result for shorter time to prevent repeated queries for non-existent users
+      meCache.set(userId, { data: null, expires: Date.now() + 10 * 1000 }) // cache 10s
+    }
+    
+    return data
+  } catch (err) {
+    console.error('getUserById error:', err)
+    return null
+  }
 }
 
 app.get('/api/me', requireAuth, async (req, res) => {
@@ -1014,55 +1056,97 @@ app.get('/api/me', requireAuth, async (req, res) => {
 app.patch('/api/me', requireAuth, async (req, res) => {
   try {
     const { name, first_name, last_name, phone, company, title, bio, location, website_url, twitter_url, linkedin_url, github_url, avatar_url } = req.body || {}
-    const fields = []
-    const params = []
-    function pushSanitized(field, value, opts) {
-      if (typeof value === 'string') {
-        fields.push(`${field} = ?`)
-        params.push(sanitizeText(value, opts))
-      }
-    }
+    
+    // Validate and sanitize each field individually
+    const updates = {}
+    
     if (typeof name === 'string') {
-      fields.push('name = ?')
-      params.push(sanitizeText(name, { maxLen: 100 }))
+      updates.name = sanitizeText(name, { maxLen: 100 })
     }
+    
     if (typeof first_name === 'string') {
       const v = sanitizeText(first_name, { maxLen: 50 })
       if (!v) return res.status(400).json({ error: 'First name is required' })
-      fields.push('first_name = ?')
-      params.push(v)
+      updates.first_name = v
     }
+    
     if (typeof last_name === 'string') {
       const v = sanitizeText(last_name, { maxLen: 50 })
       if (!v) return res.status(400).json({ error: 'Last name is required' })
-      fields.push('last_name = ?')
-      params.push(v)
+      updates.last_name = v
     }
+    
     if (typeof phone === 'string') {
       const p = phone.trim()
       if (p && !validatePhoneE164(p)) {
         return res.status(400).json({ error: 'Invalid phone format (E.164)' })
       }
-      fields.push('phone = ?')
-      params.push(p || null)
+      updates.phone = p || null
     }
-    pushSanitized('company', company, { maxLen: 100 })
-    pushSanitized('title', title, { maxLen: 100 })
+    
+    if (typeof company === 'string') {
+      updates.company = sanitizeText(company, { maxLen: 100 })
+    }
+    
+    if (typeof title === 'string') {
+      updates.title = sanitizeText(title, { maxLen: 100 })
+    }
+    
     if (typeof bio === 'string') {
-      fields.push('bio = ?')
-      params.push(sanitizeHtmlBasic(bio, { maxLen: 65535 }))
+      updates.bio = sanitizeHtmlBasic(bio, { maxLen: 65535 })
     }
-    pushSanitized('location', location, { maxLen: 255 })
-    pushSanitized('website_url', website_url, { maxLen: 255 })
-    pushSanitized('twitter_url', twitter_url, { maxLen: 255 })
-    pushSanitized('linkedin_url', linkedin_url, { maxLen: 255 })
-    pushSanitized('github_url', github_url, { maxLen: 255 })
-    pushSanitized('avatar_url', avatar_url, { maxLen: 1024 })
-    if (fields.length === 0) return res.status(400).json({ error: 'No valid fields provided' })
-    params.push(req.auth.userId)
-    await pool.execute(`UPDATE \`${DB_NAME}\`.users SET ${fields.join(', ')} WHERE id = ?`, params)
-    meCache.delete(req.auth.userId)
+    
+    if (typeof location === 'string') {
+      updates.location = sanitizeText(location, { maxLen: 255 })
+    }
+    
+    if (typeof website_url === 'string') {
+      updates.website_url = sanitizeText(website_url, { maxLen: 255 })
+    }
+    
+    if (typeof twitter_url === 'string') {
+      updates.twitter_url = sanitizeText(twitter_url, { maxLen: 255 })
+    }
+    
+    if (typeof linkedin_url === 'string') {
+      updates.linkedin_url = sanitizeText(linkedin_url, { maxLen: 255 })
+    }
+    
+    if (typeof github_url === 'string') {
+      updates.github_url = sanitizeText(github_url, { maxLen: 255 })
+    }
+    
+    if (typeof avatar_url === 'string') {
+      updates.avatar_url = sanitizeText(avatar_url, { maxLen: 1024 })
+    }
+    
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided' })
+    }
+    
+    // Build safe, parameterized query with explicit field names
+    const allowedFields = ['name', 'first_name', 'last_name', 'phone', 'company', 'title', 'bio', 'location', 'website_url', 'twitter_url', 'linkedin_url', 'github_url', 'avatar_url']
+    const validUpdates = {}
+    
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedFields.includes(key)) {
+        validUpdates[key] = value
+      }
+    }
+    
+    if (Object.keys(validUpdates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided' })
+    }
+    
+    // Build safe query with explicit field mapping
+    const setClause = Object.keys(validUpdates).map(field => `${field} = ?`).join(', ')
+    const values = Object.values(validUpdates)
+    values.push(req.auth.userId) // for WHERE clause
+    
+    await pool.execute(`UPDATE \`${DB_NAME}\`.users SET ${setClause} WHERE id = ?`, values)
+    clearUserCache(req.auth.userId)
     return res.json({ message: 'Profile updated' })
+    
   } catch (err) {
     console.error('PATCH /api/me error:', err)
     return res.status(500).json({ error: 'Internal server error' })
@@ -1268,124 +1352,20 @@ app.put('/api/users/:id/profile', requireCsrf, requireAuth, async (req, res) => 
 
 // Avatar upload feature removed: no memory upload route or handlers
 
-// General file upload: allow JPG, PNG, PDF
+// DEPRECATED: Old file upload system - redirects to new base64 system
 app.post('/api/me/upload', requireAuth, upload.single('file'), async (req, res) => {
-  try {
-    const filePath = req.file?.path
-    if (!filePath) return res.status(400).json({ error: 'No file uploaded' })
-    console.log(`Upload request received. File path: ${filePath}, Original filename: ${req.file?.originalname}, Size: ${req.file?.size}`)
-    const ft = await verifyFileType(filePath)
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf']
-    if (!ft || !allowed.includes(ft.mime)) {
-      try { fs.rmSync(filePath, { force: true }) } catch {}
-      console.error(`File type detection failed. Detected: ${ft?.mime || 'null'}, Original filename: ${req.file?.originalname}`)
-      return res.status(400).json({ error: `Invalid file type. Detected: ${ft?.mime || 'unknown'}. Allowed: JPG, PNG, WEBP, PDF` })
-    }
-
-    const { isInfected } = await scanFileForVirus(filePath)
-    if (isInfected) {
-      try { fs.rmSync(filePath, { force: true }) } catch {}
-      return res.status(400).json({ error: 'File failed virus scan' })
-    }
-
-    let finalPath = null
-    if (USE_S3 && S3Client && UploadS3 && S3_BUCKET) {
-      try {
-        const key = `general/${req.auth.userId}/${path.basename(filePath)}`
-        const uploader = new UploadS3({ client: S3Client, params: { Bucket: S3_BUCKET, Key: key, Body: fs.createReadStream(filePath), ContentType: ft.mime } })
-        await uploader.done()
-        if (S3_BASE_URL) {
-          finalPath = `${S3_BASE_URL}/${key}`
-        } else {
-          finalPath = `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${key}`
-        }
-      } catch (err) {
-        console.error('S3 upload failed, reverting to local path:', err.message)
-      } finally {
-        try { fs.rmSync(filePath, { force: true }) } catch {}
-      }
-    }
-    if (!finalPath) {
-      const relPath = path.relative(__dirname, filePath).replace(/\\/g, '/')
-      finalPath = relPath
-      if (process.platform !== 'win32') {
-        try { fs.chmodSync(filePath, 0o640) } catch {}
-      }
-    }
-    
-    // If it's an image file, also update the user's avatar_url field
-    const isImage = ['image/jpeg', 'image/png', 'image/webp'].includes(ft.mime)
-    if (isImage) {
-      try {
-        await pool.execute(`UPDATE \`${DB_NAME}\`.users SET avatar_url = ? WHERE id = ?`, [finalPath, req.auth.userId])
-        meCache.delete(req.auth.userId)
-      } catch (err) {
-        console.error('Failed to update avatar_url:', err)
-      }
-    }
-    
-    return res.json({ message: 'File uploaded', path: finalPath, mime: ft.mime })
-  } catch (err) {
-    console.error('POST /api/me/upload error:', err)
-    return res.status(500).json({ error: 'Internal server error' })
-  }
+  return res.status(410).json({ 
+    error: 'This endpoint is deprecated. Please use POST /api/me/image with base64 data instead.',
+    migration_guide: 'Convert your image to base64 and send it to /api/me/image endpoint'
+  })
 })
 
+// DEPRECATED: Old avatar upload system - redirects to new base64 system
 app.post('/api/me/avatar', requireAuth, upload.single('file'), async (req, res) => {
-  try {
-    const filePath = req.file?.path
-    if (!filePath) return res.status(400).json({ error: 'No file uploaded' })
-    console.log(`Avatar upload request received. File path: ${filePath}, Original filename: ${req.file?.originalname}, Size: ${req.file?.size}`)
-    const ft = await verifyFileType(filePath)
-    const allowed = ['image/jpeg', 'image/png', 'image/webp']
-    if (!ft || !allowed.includes(ft.mime)) {
-      try { fs.rmSync(filePath, { force: true }) } catch {}
-      console.error(`Avatar file type detection failed. Detected: ${ft?.mime || 'null'}, Original filename: ${req.file?.originalname}`)
-      return res.status(400).json({ error: `Invalid file type. Detected: ${ft?.mime || 'unknown'}. Allowed: JPG, PNG, WEBP` })
-    }
-
-    const { isInfected } = await scanFileForVirus(filePath)
-    if (isInfected) {
-      try { fs.rmSync(filePath, { force: true }) } catch {}
-      return res.status(400).json({ error: 'File failed virus scan' })
-    }
-
-    let size = 0
-    try { const st = fs.statSync(filePath); size = Number(st.size) || 0 } catch {}
-    let finalPath = null
-    if (USE_S3 && S3Client && UploadS3 && S3_BUCKET) {
-      try {
-        const key = `avatars/${req.auth.userId}/${path.basename(filePath)}`
-        const uploader = new UploadS3({ client: S3Client, params: { Bucket: S3_BUCKET, Key: key, Body: fs.createReadStream(filePath), ContentType: ft.mime } })
-        await uploader.done()
-        if (S3_BASE_URL) {
-          finalPath = `${S3_BASE_URL}/${key}`
-        } else {
-          finalPath = `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${key}`
-        }
-      } catch (err) {
-        console.error('S3 upload failed, reverting to local path:', err.message)
-      } finally {
-        try { fs.rmSync(filePath, { force: true }) } catch {}
-      }
-    }
-    if (!finalPath) {
-      const relPath = path.relative(__dirname, filePath).replace(/\\/g, '/')
-      finalPath = relPath
-      if (process.platform !== 'win32') {
-        try { fs.chmodSync(filePath, 0o640) } catch {}
-      }
-    }
-    try {
-      await pool.execute(`UPDATE \`${DB_NAME}\`.users SET avatar_url = ? WHERE id = ?`, [finalPath, req.auth.userId])
-      await pool.execute(`INSERT INTO \`${DB_NAME}\`.user_avatars (user_id, path, mime, size) VALUES (?, ?, ?, ?)`, [req.auth.userId, finalPath, ft.mime, size])
-      meCache.delete(req.auth.userId)
-    } catch {}
-    return res.json({ path: finalPath, mime: ft.mime })
-  } catch (err) {
-    console.error('POST /api/me/avatar error:', err)
-    return res.status(500).json({ error: 'Internal server error' })
-  }
+  return res.status(410).json({ 
+    error: 'This endpoint is deprecated. Please use POST /api/me/image with base64 data instead.',
+    migration_guide: 'Convert your avatar image to base64 and send it to /api/me/image endpoint'
+  })
 })
 
 // ---------- Base64 Image Storage (New System) ----------
@@ -1394,8 +1374,30 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
   try {
     const { image_data, mime_type, image_type = 'profile', width, height } = req.body || {}
     
+    // Input validation
     if (!image_data || !mime_type) {
       return res.status(400).json({ error: 'Image data and MIME type are required' })
+    }
+    
+    if (typeof image_data !== 'string' || image_data.length === 0) {
+      return res.status(400).json({ error: 'Image data must be a non-empty string' })
+    }
+    
+    if (typeof mime_type !== 'string' || mime_type.length === 0) {
+      return res.status(400).json({ error: 'MIME type must be a non-empty string' })
+    }
+    
+    // Validate image_type if provided
+    if (image_type && typeof image_type !== 'string') {
+      return res.status(400).json({ error: 'Image type must be a string' })
+    }
+    
+    // Validate dimensions if provided
+    if (width !== undefined && (typeof width !== 'number' || width < 0)) {
+      return res.status(400).json({ error: 'Width must be a positive number' })
+    }
+    if (height !== undefined && (typeof height !== 'number' || height < 0)) {
+      return res.status(400).json({ error: 'Height must be a positive number' })
     }
 
     // Validate MIME type
@@ -1406,11 +1408,14 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
 
     // Validate base64 data (basic check)
     if (!/^data:image\/[a-zA-Z+]+;base64,/.test(image_data)) {
-      return res.status(400).json({ error: 'Invalid image data format' })
+      return res.status(400).json({ error: 'Invalid image data format. Must start with data:image/...;base64,' })
     }
 
     // Calculate file size (approximate)
     const base64Data = image_data.split(',')[1]
+    if (!base64Data || base64Data.length === 0) {
+      return res.status(400).json({ error: 'Invalid base64 data' })
+    }
     const fileSize = Math.ceil(base64Data.length * 0.75)
 
     // Check file size (5MB limit)
@@ -1419,26 +1424,43 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
     }
 
     // Deactivate any existing profile images for this user
-    await pool.execute(
-      `UPDATE \`${DB_NAME}\`.user_images SET is_active = 0 WHERE user_id = ? AND image_type = ?`,
-      [req.auth.userId, image_type]
-    )
+    try {
+      await pool.execute(
+        `UPDATE \`${DB_NAME}\`.user_images SET is_active = 0 WHERE user_id = ? AND image_type = ?`,
+        [req.auth.userId, image_type]
+      )
+    } catch (err) {
+      console.error('Failed to deactivate existing images:', err)
+      // Continue with upload even if deactivation fails
+    }
 
     // Insert new image
-    const [result] = await pool.execute(
-      `INSERT INTO \`${DB_NAME}\`.user_images (user_id, image_data, mime_type, image_type, file_size, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [req.auth.userId, image_data, mime_type, image_type, fileSize, width || null, height || null]
-    )
+    let result
+    try {
+      const [insertResult] = await pool.execute(
+        `INSERT INTO \`${DB_NAME}\`.user_images (user_id, image_data, mime_type, image_type, file_size, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [req.auth.userId, image_data, mime_type, image_type, fileSize, width || null, height || null]
+      )
+      result = insertResult
+    } catch (err) {
+      console.error('Failed to insert image into database:', err)
+      return res.status(500).json({ error: 'Failed to save image to database' })
+    }
 
     // Update user's avatar_url field for backward compatibility
     const imageUrl = `/api/me/image/${result.insertId}`
-    await pool.execute(
-      `UPDATE \`${DB_NAME}\`.users SET avatar_url = ? WHERE id = ?`,
-      [imageUrl, req.auth.userId]
-    )
+    try {
+      await pool.execute(
+        `UPDATE \`${DB_NAME}\`.users SET avatar_url = ? WHERE id = ?`,
+        [imageUrl, req.auth.userId]
+      )
+    } catch (err) {
+      console.error('Failed to update user avatar_url:', err)
+      // Continue even if avatar_url update fails - the image is still saved
+    }
 
     // Clear cache
-    meCache.delete(req.auth.userId)
+    clearUserCache(req.auth.userId)
 
     return res.json({ 
       id: result.insertId, 
@@ -1515,32 +1537,51 @@ app.get('/api/me/image', requireAuth, async (req, res) => {
 app.delete('/api/me/image/:id', requireAuth, async (req, res) => {
   try {
     const imageId = Number(req.params.id)
-    if (!imageId) return res.status(400).json({ error: 'Invalid image ID' })
+    if (!imageId || imageId <= 0) {
+      return res.status(400).json({ error: 'Invalid image ID' })
+    }
 
     // Check if image belongs to user
-    const [rows] = await pool.execute(
-      `SELECT id FROM \`${DB_NAME}\`.user_images WHERE id = ? AND user_id = ? LIMIT 1`,
-      [imageId, req.auth.userId]
-    )
+    let rows
+    try {
+      const [result] = await pool.execute(
+        `SELECT id FROM \`${DB_NAME}\`.user_images WHERE id = ? AND user_id = ? LIMIT 1`,
+        [imageId, req.auth.userId]
+      )
+      rows = result
+    } catch (err) {
+      console.error('Database query failed:', err)
+      return res.status(500).json({ error: 'Database query failed' })
+    }
 
     if (!rows || rows.length === 0) {
-      return res.status(404).json({ error: 'Image not found' })
+      return res.status(404).json({ error: 'Image not found or does not belong to you' })
     }
 
     // Delete the image
-    await pool.execute(
-      `DELETE FROM \`${DB_NAME}\`.user_images WHERE id = ?`,
-      [imageId]
-    )
+    try {
+      await pool.execute(
+        `DELETE FROM \`${DB_NAME}\`.user_images WHERE id = ?`,
+        [imageId]
+      )
+    } catch (err) {
+      console.error('Failed to delete image:', err)
+      return res.status(500).json({ error: 'Failed to delete image' })
+    }
 
     // If this was the active profile image, clear avatar_url
-    await pool.execute(
-      `UPDATE \`${DB_NAME}\`.users SET avatar_url = NULL WHERE id = ? AND avatar_url = ?`,
-      [req.auth.userId, `/api/me/image/${imageId}`]
-    )
+    try {
+      await pool.execute(
+        `UPDATE \`${DB_NAME}\`.users SET avatar_url = NULL WHERE id = ? AND avatar_url = ?`,
+        [req.auth.userId, `/api/me/image/${imageId}`]
+      )
+    } catch (err) {
+      console.error('Failed to clear avatar_url:', err)
+      // Continue even if this fails
+    }
 
     // Clear cache
-    meCache.delete(req.auth.userId)
+    clearUserCache(req.auth.userId)
 
     return res.json({ message: 'Image deleted successfully' })
   } catch (err) {
