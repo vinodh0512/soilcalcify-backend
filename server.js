@@ -201,6 +201,9 @@ app.get('/api/test', (req, res) => {
   res.json({ status: 'success', message: 'Frontend connected to Backend successfully!' })
 })
 
+// Allow larger JSON payloads for base64 images
+app.use(express.json({ limit: '10mb' }))
+
 function getClientIp(req) {
   const xff = (req.headers['x-forwarded-for'] || '').toString()
   if (xff) {
@@ -931,6 +934,35 @@ async function ensureSchema() {
       const code = err && err.code
       if (code !== 'ER_DUP_KEYNAME' && code !== 'ER_CANNOT_ADD_FOREIGN') {
         console.warn('FK add (analytics) failed (non-fatal):', code || err.message)
+      }
+    }
+
+    // Ensure user_images table exists for base64 avatars
+    const createUserImagesSQL = `
+      CREATE TABLE IF NOT EXISTS \`${DB_NAME}\`.user_images (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id INT UNSIGNED NOT NULL,
+        image_data LONGTEXT NOT NULL,
+        image_type VARCHAR(50) NOT NULL DEFAULT 'profile',
+        mime_type VARCHAR(100) NOT NULL,
+        file_size INT UNSIGNED NOT NULL,
+        width INT UNSIGNED NULL,
+        height INT UNSIGNED NULL,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_user_images_user_id (user_id),
+        KEY idx_user_images_user_type (user_id, image_type)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `
+    await pool.execute(createUserImagesSQL)
+    try {
+      await pool.execute(`ALTER TABLE \`${DB_NAME}\`.user_images ADD CONSTRAINT fk_user_images_user FOREIGN KEY (user_id) REFERENCES \`${DB_NAME}\`.users(id) ON DELETE CASCADE`)
+    } catch (err) {
+      const code = err && err.code
+      if (code !== 'ER_DUP_KEYNAME' && code !== 'ER_CANNOT_ADD_FOREIGN') {
+        console.warn('FK add (user_images) failed (non-fatal):', code || err.message)
       }
     }
   } catch (err) {
