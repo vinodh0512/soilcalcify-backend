@@ -975,6 +975,39 @@ async function ensureSchema() {
         console.warn('FK add (user_images) failed (non-fatal):', code || err.message)
       }
     }
+
+    // Create projects table for user project management
+    const createProjectsSQL = `
+      CREATE TABLE IF NOT EXISTS \`${DB_NAME}\`.projects (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id INT UNSIGNED NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        status ENUM('planning', 'in_progress', 'completed', 'on_hold') NOT NULL DEFAULT 'planning',
+        start_date DATE,
+        end_date DATE,
+        budget DECIMAL(15,2),
+        location VARCHAR(255),
+        client_name VARCHAR(255),
+        project_type ENUM('residential', 'commercial', 'infrastructure', 'industrial', 'other') NOT NULL DEFAULT 'residential',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_projects_user_id (user_id),
+        KEY idx_projects_status (status),
+        KEY idx_projects_type (project_type),
+        KEY idx_projects_user_status (user_id, status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `
+    await pool.execute(createProjectsSQL)
+    try {
+      await pool.execute(`ALTER TABLE \`${DB_NAME}\`.projects ADD CONSTRAINT fk_projects_user FOREIGN KEY (user_id) REFERENCES \`${DB_NAME}\`.users(id) ON DELETE CASCADE`)
+    } catch (err) {
+      const code = err && err.code
+      if (code !== 'ER_DUP_KEYNAME' && code !== 'ER_CANNOT_ADD_FOREIGN') {
+        console.warn('FK add (projects) failed (non-fatal):', code || err.message)
+      }
+    }
   } catch (err) {
     console.error('Failed to ensure schema:', err.message)
     throw err
@@ -1407,10 +1440,10 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
     }
 
     // Validate MIME type
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/svg+xml']
     if (!allowedTypes.includes(mime_type)) {
       console.log('Invalid mime_type:', mime_type)
-      return res.status(400).json({ error: 'Invalid image type. Allowed: JPG, PNG, WebP' })
+      return res.status(400).json({ error: 'Invalid image type. Allowed: JPG, PNG, WebP, SVG' })
     }
 
     // Validate base64 data (basic check)
@@ -1484,17 +1517,26 @@ app.post('/api/me/image', requireAuth, async (req, res) => {
   }
 })
 
-// Get user image by ID
-app.get('/api/me/image/:id', requireAuth, async (req, res) => {
+// Handle OPTIONS for image endpoint
+app.options('/api/me/image/:id', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  res.setHeader('Access-Control-Max-Age', '86400')
+  return res.status(204).send()
+})
+
+// Get user image by ID - Public endpoint for serving images
+app.get('/api/me/image/:id', async (req, res) => {
   try {
     const imageId = Number(req.params.id)
-    console.log(`Serving image ID: ${imageId} for user: ${req.auth.userId}`)
+    console.log(`Serving image ID: ${imageId}`)
     
     if (!imageId) return res.status(400).json({ error: 'Invalid image ID' })
 
     const [rows] = await pool.execute(
-      `SELECT image_data, mime_type FROM \`${DB_NAME}\`.user_images WHERE id = ? AND user_id = ? LIMIT 1`,
-      [imageId, req.auth.userId]
+      `SELECT image_data, mime_type, user_id, is_active FROM \`${DB_NAME}\`.user_images WHERE id = ? AND is_active = 1 LIMIT 1`,
+      [imageId]
     )
 
     console.log(`Image query result:`, rows)
@@ -1504,20 +1546,49 @@ app.get('/api/me/image/:id', requireAuth, async (req, res) => {
     }
 
     const image = rows[0]
-    console.log(`Found image with mime_type: ${image.mime_type}`)
+    console.log(`Found image with mime_type: ${image.mime_type} for user: ${image.user_id}`)
     
-    // Set appropriate headers and send image data
+    // Set appropriate headers for image serving
     res.setHeader('Content-Type', image.mime_type)
     res.setHeader('Cache-Control', 'public, max-age=31536000') // Cache for 1 year
     
+    // Remove problematic security headers for images
+    res.removeHeader('X-Content-Type-Options')
+    res.removeHeader('X-Frame-Options')
+    
+    // Add CORS headers for cross-origin image loading
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    
     // Extract base64 data and convert to buffer
     const base64Data = image.image_data.split(',')[1]
-    const imageBuffer = Buffer.from(base64Data, 'base64')
+    if (!base64Data) {
+      console.error('Invalid base64 data in image')
+      return res.status(404).json({ error: 'Image data corrupted' })
+    }
     
-    console.log(`Sending image buffer of size: ${imageBuffer.length} bytes`)
-    return res.send(imageBuffer)
+    try {
+      const imageBuffer = Buffer.from(base64Data, 'base64')
+      
+      if (imageBuffer.length === 0) {
+        console.error('Empty image buffer')
+        return res.status(404).json({ error: 'Image data empty' })
+      }
+      
+      console.log(`Sending image buffer of size: ${imageBuffer.length} bytes, mime_type: ${image.mime_type}`)
+      return res.send(imageBuffer)
+    } catch (bufferError) {
+      console.error('Failed to create image buffer:', bufferError)
+      return res.status(500).json({ error: 'Failed to process image data' })
+    }
   } catch (err) {
     console.error('GET /api/me/image/:id error:', err)
+    console.error('Error details:', {
+      message: err.message,
+      stack: err.stack,
+      imageId: req.params.id
+    })
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
@@ -1605,6 +1676,232 @@ app.delete('/api/me/image/:id', requireAuth, async (req, res) => {
     return res.json({ message: 'Image deleted successfully' })
   } catch (err) {
     console.error('DELETE /api/me/image/:id error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ---------- Projects Management ----------
+// Get all projects for current user
+app.get('/api/me/projects', requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT id, title, description, status, start_date, end_date, budget, location, client_name, project_type, created_at, updated_at 
+       FROM \`${DB_NAME}\`.projects 
+       WHERE user_id = ? 
+       ORDER BY created_at DESC`,
+      [req.auth.userId]
+    )
+    
+    return res.json({ projects: rows || [] })
+  } catch (err) {
+    console.error('GET /api/me/projects error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// Get single project by ID for current user
+app.get('/api/me/projects/:id', requireAuth, async (req, res) => {
+  try {
+    const projectId = Number(req.params.id)
+    if (!projectId) return res.status(400).json({ error: 'Invalid project ID' })
+    
+    const [rows] = await pool.execute(
+      `SELECT id, title, description, status, start_date, end_date, budget, location, client_name, project_type, created_at, updated_at 
+       FROM \`${DB_NAME}\`.projects 
+       WHERE id = ? AND user_id = ? LIMIT 1`,
+      [projectId, req.auth.userId]
+    )
+    
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: 'Project not found' })
+    }
+    
+    return res.json({ project: rows[0] })
+  } catch (err) {
+    console.error('GET /api/me/projects/:id error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// Create new project for current user
+app.post('/api/me/projects', requireAuth, async (req, res) => {
+  try {
+    const { title, description, status, start_date, end_date, budget, location, client_name, project_type } = req.body || {}
+    
+    // Validate required fields
+    if (!title || typeof title !== 'string' || title.trim().length === 0) {
+      return res.status(400).json({ error: 'Title is required' })
+    }
+    
+    if (!project_type || !['residential', 'commercial', 'infrastructure', 'industrial', 'other'].includes(project_type)) {
+      return res.status(400).json({ error: 'Valid project type is required' })
+    }
+    
+    if (status && !['planning', 'in_progress', 'completed', 'on_hold'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid project status' })
+    }
+    
+    // Sanitize and validate optional fields
+    const projectData = {
+      title: sanitizeText(title, { maxLen: 255 }),
+      description: description ? sanitizeText(description, { maxLen: 5000 }) : null,
+      status: status || 'planning',
+      start_date: start_date ? new Date(start_date).toISOString().split('T')[0] : null,
+      end_date: end_date ? new Date(end_date).toISOString().split('T')[0] : null,
+      budget: budget && !isNaN(parseFloat(budget)) ? parseFloat(budget) : null,
+      location: location ? sanitizeText(location, { maxLen: 255 }) : null,
+      client_name: client_name ? sanitizeText(client_name, { maxLen: 255 }) : null,
+      project_type: project_type,
+      user_id: req.auth.userId
+    }
+    
+    // Validate dates
+    if (projectData.start_date && projectData.end_date) {
+      if (new Date(projectData.end_date) < new Date(projectData.start_date)) {
+        return res.status(400).json({ error: 'End date must be after start date' })
+      }
+    }
+    
+    // Validate budget
+    if (projectData.budget !== null && (projectData.budget < 0 || projectData.budget > 999999999.99)) {
+      return res.status(400).json({ error: 'Budget must be between 0 and 999,999,999.99' })
+    }
+    
+    const [result] = await pool.execute(
+      `INSERT INTO \`${DB_NAME}\`.projects (user_id, title, description, status, start_date, end_date, budget, location, client_name, project_type) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [projectData.user_id, projectData.title, projectData.description, projectData.status, 
+       projectData.start_date, projectData.end_date, projectData.budget, projectData.location, 
+       projectData.client_name, projectData.project_type]
+    )
+    
+    return res.status(201).json({ 
+      message: 'Project created successfully',
+      project_id: result.insertId
+    })
+  } catch (err) {
+    console.error('POST /api/me/projects error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// Update existing project for current user
+app.patch('/api/me/projects/:id', requireAuth, async (req, res) => {
+  try {
+    const projectId = Number(req.params.id)
+    if (!projectId) return res.status(400).json({ error: 'Invalid project ID' })
+    
+    const { title, description, status, start_date, end_date, budget, location, client_name, project_type } = req.body || {}
+    
+    // Check if project exists and belongs to user
+    const [existingRows] = await pool.execute(
+      'SELECT id FROM \`${DB_NAME}\`.projects WHERE id = ? AND user_id = ? LIMIT 1',
+      [projectId, req.auth.userId]
+    )
+    
+    if (!existingRows || existingRows.length === 0) {
+      return res.status(404).json({ error: 'Project not found' })
+    }
+    
+    // Build update fields
+    const updates = {}
+    const allowedFields = ['title', 'description', 'status', 'start_date', 'end_date', 'budget', 'location', 'client_name', 'project_type']
+    
+    if (title !== undefined && typeof title === 'string' && title.trim().length > 0) {
+      updates.title = sanitizeText(title, { maxLen: 255 })
+    }
+    
+    if (description !== undefined) {
+      updates.description = description ? sanitizeText(description, { maxLen: 5000 }) : null
+    }
+    
+    if (status !== undefined) {
+      if (!['planning', 'in_progress', 'completed', 'on_hold'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid project status' })
+      }
+      updates.status = status
+    }
+    
+    if (start_date !== undefined) {
+      updates.start_date = start_date ? new Date(start_date).toISOString().split('T')[0] : null
+    }
+    
+    if (end_date !== undefined) {
+      updates.end_date = end_date ? new Date(end_date).toISOString().split('T')[0] : null
+    }
+    
+    if (budget !== undefined) {
+      if (budget === null || budget === '') {
+        updates.budget = null
+      } else if (!isNaN(parseFloat(budget))) {
+        const budgetValue = parseFloat(budget)
+        if (budgetValue < 0 || budgetValue > 999999999.99) {
+          return res.status(400).json({ error: 'Budget must be between 0 and 999,999,999.99' })
+        }
+        updates.budget = budgetValue
+      }
+    }
+    
+    if (location !== undefined) {
+      updates.location = location ? sanitizeText(location, { maxLen: 255 }) : null
+    }
+    
+    if (client_name !== undefined) {
+      updates.client_name = client_name ? sanitizeText(client_name, { maxLen: 255 }) : null
+    }
+    
+    if (project_type !== undefined) {
+      if (!['residential', 'commercial', 'infrastructure', 'industrial', 'other'].includes(project_type)) {
+        return res.status(400).json({ error: 'Invalid project type' })
+      }
+      updates.project_type = project_type
+    }
+    
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided' })
+    }
+    
+    // Validate date relationship
+    if (updates.start_date && updates.end_date) {
+      if (new Date(updates.end_date) < new Date(updates.start_date)) {
+        return res.status(400).json({ error: 'End date must be after start date' })
+      }
+    }
+    
+    // Build and execute update query
+    const setClause = Object.keys(updates).map(field => `${field} = ?`).join(', ')
+    const values = [...Object.values(updates), projectId]
+    
+    await pool.execute(
+      `UPDATE \`${DB_NAME}\`.projects SET ${setClause} WHERE id = ?`,
+      values
+    )
+    
+    return res.json({ message: 'Project updated successfully' })
+  } catch (err) {
+    console.error('PATCH /api/me/projects/:id error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// Delete project for current user
+app.delete('/api/me/projects/:id', requireAuth, async (req, res) => {
+  try {
+    const projectId = Number(req.params.id)
+    if (!projectId) return res.status(400).json({ error: 'Invalid project ID' })
+    
+    const [result] = await pool.execute(
+      'DELETE FROM \`${DB_NAME}\`.projects WHERE id = ? AND user_id = ?',
+      [projectId, req.auth.userId]
+    )
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Project not found' })
+    }
+    
+    return res.json({ message: 'Project deleted successfully' })
+  } catch (err) {
+    console.error('DELETE /api/me/projects/:id error:', err)
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
